@@ -10,8 +10,10 @@ import {
   Power,
   ShieldAlert,
   RotateCcw,
-  Sparkles
+  Sparkles,
+  Camera
 } from "lucide-react";
+
 
 interface FixtureProfile {
   name: string;
@@ -91,6 +93,8 @@ export default function App() {
     currentStepName: string;
   } | null>(null);
   const [lastSelfTestReport, setLastSelfTestReport] = useState<FixtureHealthReport | null>(null);
+  const [scanningChannel, setScanningChannel] = useState<number | null>(null);
+  const scanTimeoutRef = useRef<{ resolve: (value?: any) => void; timeout: any; channel: number } | null>(null);
 
   // Fault Simulator State (fixtureId -> simulator values)
   const [simulatedSensors, setSimulatedSensors] = useState<Record<string, {
@@ -106,6 +110,26 @@ export default function App() {
   });
 
   // Performance Stats
+  // Camera Diagnostic States
+  const [sensorSource, setSensorSource] = useState<"simulated" | "webcam" | "screen">("simulated");
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [fixtureCoords, setFixtureCoords] = useState<Record<string, { x: number; y: number }>>({
+    par1: { x: 30, y: 50 },
+    par2: { x: 50, y: 50 },
+    par3: { x: 70, y: 50 },
+  });
+  const [cameraSensors, setCameraSensors] = useState<Record<string, { r: number; g: number; b: number }>>({});
+  const [ambientBaselines, setAmbientBaselines] = useState<Record<string, { r: number; g: number; b: number }>>({});
+  const [cameraGain, setCameraGain] = useState<number>(1.5);
+  const [isCalibrating, setIsCalibrating] = useState<boolean>(false);
+  
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const fixtureTempsRef = useRef<Record<string, number>>({});
+  const luxHistoryRef = useRef<Record<string, number[]>>({});
+
+
   const [fps, setFps] = useState(0);
   const [packetsSent, setPacketsSent] = useState(0);
   const [totalBytes, setTotalBytes] = useState(0);
@@ -135,6 +159,123 @@ export default function App() {
     { id: "scene1", name: "Azul Misterioso", buffer: [] },
     { id: "scene2", name: "Cálido Atardecer", buffer: [] }
   ]);
+
+  // Camera Controls
+  // Camera Controls
+  const startCamera = async (type: "webcam" | "screen") => {
+    setCameraError(null);
+    try {
+      let stream: MediaStream;
+      if (type === "webcam") {
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: { ideal: 640 }, height: { ideal: 480 } } 
+        });
+      } else {
+        stream = await navigator.mediaDevices.getDisplayMedia({ 
+          video: { width: { ideal: 640 }, height: { ideal: 480 } } 
+        });
+      }
+      setCameraStream(stream);
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+    } catch (err: any) {
+      console.error(`Error al iniciar ${type}:`, err);
+      setCameraError(err.message || `No se pudo acceder a la fuente de video.`);
+      setSensorSource("simulated");
+    }
+  };
+
+  const stopCamera = () => {
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+      setCameraStream(null);
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  };
+
+  // Start/Stop camera on source toggle
+  useEffect(() => {
+    if (sensorSource === "webcam" || sensorSource === "screen") {
+      startCamera(sensorSource);
+    } else {
+      stopCamera();
+    }
+    return () => {
+      stopCamera();
+    };
+  }, [sensorSource]);
+
+  // Bind video element to stream when it mounts or shifts
+  useEffect(() => {
+    if (videoRef.current && cameraStream) {
+      videoRef.current.srcObject = cameraStream;
+    }
+  }, [cameraStream, sensorSource]);
+
+  // Ambient Light Noise-Floor Calibration
+  const calibrateAmbient = async () => {
+    if (!connected || isCalibrating) return;
+    setIsCalibrating(true);
+    
+    // 1. Blackout physical lights
+    triggerBlackout();
+    
+    // 2. Wait 500ms for lights to turn off
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // 3. Capture camera frame and measure background ambient light
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (video && canvas && video.readyState >= 2) {
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const nextBaselines: Record<string, { r: number; g: number; b: number }> = {};
+        
+        fixtures.forEach(f => {
+          const coords = fixtureCoords[f.id] || { x: 50, y: 50 };
+          const px = Math.round((coords.x / 100) * canvas.width);
+          const py = Math.round((coords.y / 100) * canvas.height);
+          
+          const sampleSize = 15;
+          const half = Math.floor(sampleSize / 2);
+          const startX = Math.max(0, px - half);
+          const startY = Math.max(0, py - half);
+          const width = Math.min(canvas.width - startX, sampleSize);
+          const height = Math.min(canvas.height - startY, sampleSize);
+          
+          let rSum = 0, gSum = 0, bSum = 0, count = 0;
+          try {
+            const imgData = ctx.getImageData(startX, startY, width, height);
+            const data = imgData.data;
+            for (let i = 0; i < data.length; i += 4) {
+              rSum += data[i];
+              gSum += data[i + 1];
+              bSum += data[i + 2];
+              count++;
+            }
+          } catch (e) {
+            console.error("Error sampling baseline frame", e);
+          }
+          
+          nextBaselines[f.id] = {
+            r: count > 0 ? Math.round(rSum / count) : 0,
+            g: count > 0 ? Math.round(gSum / count) : 0,
+            b: count > 0 ? Math.round(bSum / count) : 0
+          };
+        });
+        
+        setAmbientBaselines(nextBaselines);
+        console.log("[Lighting Doctor] Calibración ambiental completa. Baselines:", nextBaselines);
+      }
+    }
+    
+    setIsCalibrating(false);
+  };
+
 
   // Connect to websocket backend
   useEffect(() => {
@@ -218,52 +359,145 @@ export default function App() {
     };
   }, []);
 
-  // Closed Loop Sensor Simulation Loop
-  // Updates observed color on the server by computing expected color * simulator drifts
+  // Shared Sensor Update Loop (Simulation or Web Camera)
   useEffect(() => {
     if (!connected) return;
+
     const interval = setInterval(() => {
-      fixtures.forEach(f => {
-        const sim = simulatedSensors[f.id] || { rDrift: 1.0, gDrift: 1.0, bDrift: 1.0, temp: 25, isBroken: false };
+      if (sensorSource === "webcam" || sensorSource === "screen") {
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
         
-        // Read actual current DMX channels from the universe buffer (which includes AI Calibration scales already applied!)
-        const rIdx = f.profile.mapping.red;
-        const gIdx = f.profile.mapping.green;
-        const bIdx = f.profile.mapping.blue;
-        const dimIdx = f.profile.mapping.dimmer;
+        if (video && canvas && video.readyState >= 2) { // HAVE_CURRENT_DATA or higher
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            const nextCameraSensors: Record<string, { r: number; g: number; b: number }> = {};
+            
+            fixtures.forEach(f => {
+              const coords = fixtureCoords[f.id] || { x: 50, y: 50 };
+              const px = Math.round((coords.x / 100) * canvas.width);
+              const py = Math.round((coords.y / 100) * canvas.height);
+              
+              const sampleSize = 15;
+              const half = Math.floor(sampleSize / 2);
+              const startX = Math.max(0, px - half);
+              const startY = Math.max(0, py - half);
+              const width = Math.min(canvas.width - startX, sampleSize);
+              const height = Math.min(canvas.height - startY, sampleSize);
+              
+              let rSum = 0, gSum = 0, bSum = 0, count = 0;
+              try {
+                const imgData = ctx.getImageData(startX, startY, width, height);
+                const data = imgData.data;
+                for (let i = 0; i < data.length; i += 4) {
+                  rSum += data[i];
+                  gSum += data[i + 1];
+                  bSum += data[i + 2];
+                  count++;
+                }
+              } catch (e) {
+                // Ignore silent canvas drawing errors before initialization completes
+              }
+              
+              const rawR = count > 0 ? Math.round(rSum / count) : 0;
+              const rawG = count > 0 ? Math.round(gSum / count) : 0;
+              const rawB = count > 0 ? Math.round(bSum / count) : 0;
+              
+              const baseline = ambientBaselines[f.id] || { r: 0, g: 0, b: 0 };
+              
+              // Restar luz ambiental y amplificar con ganancia
+              let r = Math.max(0, Math.min(255, Math.round((rawR - baseline.r) * cameraGain)));
+              let g = Math.max(0, Math.min(255, Math.round((rawG - baseline.g) * cameraGain)));
+              let b = Math.max(0, Math.min(255, Math.round((rawB - baseline.b) * cameraGain)));
+              let lux = Math.round((r + g + b) / 3);
+              
+              // Historial rodante para estrobos y peak-hold
+              if (!luxHistoryRef.current[f.id]) {
+                luxHistoryRef.current[f.id] = [];
+              }
+              const history = luxHistoryRef.current[f.id] as unknown as { r: number; g: number; b: number; lux: number }[];
+              history.push({ r, g, b, lux });
+              if (history.length > 15) history.shift();
+              
+              // Detectar canal de estrobo activo
+              const strobeIdx = f.profile.mapping.strobe;
+              const strobeVal = strobeIdx ? dmxBuffer[f.address + strobeIdx - 2] || 0 : 0;
+              
+              // Filtro Peak-Hold durante parpadeos para mantener calibración AI estable
+              if (strobeVal > 15 && history.length > 0) {
+                r = Math.max(...history.map(h => h.r));
+                g = Math.max(...history.map(h => h.g));
+                b = Math.max(...history.map(h => h.b));
+                lux = Math.max(...history.map(h => h.lux));
+              }
+              
+              nextCameraSensors[f.id] = { r, g, b };
+              
+              // Simulación de temperatura física realista por atenuador
+              const dimIdx = f.profile.mapping.dimmer;
+              const dimmer = dimIdx ? dmxBuffer[f.address + dimIdx - 2] || 0 : 255;
+              const currentTemp = fixtureTempsRef.current[f.id] || 25;
+              const targetTemp = 25 + (dimmer / 255.0) * 45; // max 70 degrees C
+              const nextTemp = currentTemp + (targetTemp - currentTemp) * 0.05;
+              fixtureTempsRef.current[f.id] = nextTemp;
+              
+              sendSocketMessage("sensorUpdate", {
+                id: f.id,
+                r,
+                g,
+                b,
+                lux,
+                temp: Math.round(nextTemp)
+              });
+            });
+            
+            setCameraSensors(nextCameraSensors);
+          }
+        }
+      } else {
+        // Modo Simulación
+        fixtures.forEach(f => {
+          const sim = simulatedSensors[f.id] || { rDrift: 1.0, gDrift: 1.0, bDrift: 1.0, temp: 25, isBroken: false };
+          
+          const rIdx = f.profile.mapping.red;
+          const gIdx = f.profile.mapping.green;
+          const bIdx = f.profile.mapping.blue;
+          const dimIdx = f.profile.mapping.dimmer;
 
-        const dimmer = dimIdx ? dmxBuffer[f.address + dimIdx - 2] || 0 : 255;
-        const dimScale = dimmer / 255.0;
+          const dimmer = dimIdx ? dmxBuffer[f.address + dimIdx - 2] || 0 : 255;
+          const dimScale = dimmer / 255.0;
 
-        const rawR = rIdx ? dmxBuffer[f.address + rIdx - 2] || 0 : 0;
-        const rawG = gIdx ? dmxBuffer[f.address + gIdx - 2] || 0 : 0;
-        const rawB = bIdx ? dmxBuffer[f.address + bIdx - 2] || 0 : 0;
+          const rawR = rIdx ? dmxBuffer[f.address + rIdx - 2] || 0 : 0;
+          const rawG = gIdx ? dmxBuffer[f.address + gIdx - 2] || 0 : 0;
+          const rawB = bIdx ? dmxBuffer[f.address + bIdx - 2] || 0 : 0;
 
-        // Apply simulated physical drifts / faults (burned bulb, aging drift, high temperature)
-        let rObs = rawR * dimScale * sim.rDrift;
-        let gObs = rawG * dimScale * (sim.isBroken ? 0.0 : sim.gDrift);
-        let bObs = rawB * dimScale * sim.bDrift;
+          let rObs = rawR * dimScale * sim.rDrift;
+          let gObs = rawG * dimScale * (sim.isBroken ? 0.0 : sim.gDrift);
+          let bObs = rawB * dimScale * sim.bDrift;
 
-        // Bound values
-        rObs = Math.max(0, Math.min(255, Math.round(rObs)));
-        gObs = Math.max(0, Math.min(255, Math.round(gObs)));
-        bObs = Math.max(0, Math.min(255, Math.round(bObs)));
+          rObs = Math.max(0, Math.min(255, Math.round(rObs)));
+          gObs = Math.max(0, Math.min(255, Math.round(gObs)));
+          bObs = Math.max(0, Math.min(255, Math.round(bObs)));
 
-        const lux = Math.round((rObs + gObs + bObs) / 3);
+          const lux = Math.round((rObs + gObs + bObs) / 3);
 
-        sendSocketMessage("sensorUpdate", {
-          id: f.id,
-          r: rObs,
-          g: gObs,
-          b: bObs,
-          lux,
-          temp: sim.temp
+          sendSocketMessage("sensorUpdate", {
+            id: f.id,
+            r: rObs,
+            g: gObs,
+            b: bObs,
+            lux,
+            temp: sim.temp
+          });
         });
-      });
+      }
     }, 150);
 
     return () => clearInterval(interval);
-  }, [fixtures, dmxBuffer, simulatedSensors, connected]);
+  }, [fixtures, dmxBuffer, simulatedSensors, connected, sensorSource, fixtureCoords, ambientBaselines, cameraGain]);
+
 
   // Web Audio microphone processing loop
   const startMic = async () => {
@@ -393,6 +627,11 @@ export default function App() {
       [newFixId]: { rDrift: 1.0, gDrift: 1.0, bDrift: 1.0, temp: 25, isBroken: false }
     }));
 
+    setFixtureCoords(prev => ({
+      ...prev,
+      [newFixId]: { x: 50, y: 50 }
+    }));
+
     setNewFixId("");
     setNewFixName("");
     setShowAddModal(false);
@@ -445,6 +684,51 @@ export default function App() {
   const triggerSelfTest = (fixtureId: string) => {
     setLastSelfTestReport(null);
     sendSocketMessage("triggerSelfTest", { id: fixtureId });
+  };
+
+  const runAutoScan = async () => {
+    if (scanningChannel !== null) {
+      stopAutoScan();
+      return;
+    }
+
+    // Blackout first
+    triggerBlackout();
+    await new Promise(resolve => setTimeout(resolve, 400));
+
+    // Turn Dimmer (CH4) to 255
+    setChannel(4, 255);
+    await new Promise(resolve => setTimeout(resolve, 400));
+
+    // Channels to test: 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12
+    const channelsToTest = [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12];
+    
+    for (const ch of channelsToTest) {
+      setScanningChannel(ch);
+      setChannel(ch, 255);
+      
+      // Wait 2 seconds
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, 2000);
+        scanTimeoutRef.current = { resolve, timeout, channel: ch };
+      });
+
+      setChannel(ch, 0);
+    }
+
+    setScanningChannel(null);
+    scanTimeoutRef.current = null;
+  };
+
+  const stopAutoScan = () => {
+    if (scanTimeoutRef.current) {
+      clearTimeout(scanTimeoutRef.current.timeout);
+      setChannel(scanTimeoutRef.current.channel, 0);
+      scanTimeoutRef.current.resolve();
+    }
+    setScanningChannel(null);
+    scanTimeoutRef.current = null;
+    triggerBlackout();
   };
 
   const updateSimulationSetting = (fixtureId: string, key: string, val: number | boolean) => {
@@ -507,6 +791,9 @@ export default function App() {
 
   // Get observed sensor readings
   const getObservedColor = (f: Fixture) => {
+    if (sensorSource === "webcam" || sensorSource === "screen") {
+      return cameraSensors[f.id] || { r: 0, g: 0, b: 0 };
+    }
     const expected = getExpectedColor(f);
     const sim = simulatedSensors[f.id] || { rDrift: 1.0, gDrift: 1.0, bDrift: 1.0, temp: 25, isBroken: false };
     
@@ -527,6 +814,7 @@ export default function App() {
       b: Math.max(0, Math.min(255, Math.round(bObs)))
     };
   };
+
 
   const getMatchPercentage = (f: Fixture) => {
     const expected = getExpectedColor(f);
@@ -780,7 +1068,40 @@ export default function App() {
               </div>
             ) : activeTab === "console" ? (
               // Manual Faders Console
-              <div className="faders-container">
+              <div style={{ display: "flex", flexDirection: "column", gap: "15px", flex: 1, minHeight: 0 }}>
+                {/* Auto Scan Banner */}
+                <div style={{ 
+                  background: scanningChannel ? "rgba(255, 0, 127, 0.08)" : "rgba(0, 240, 255, 0.05)", 
+                  border: scanningChannel ? "1px solid rgba(255, 0, 127, 0.25)" : "1px solid rgba(0, 240, 255, 0.2)", 
+                  display: "flex", 
+                  justifyContent: "space-between", 
+                  alignItems: "center", 
+                  padding: "12px 20px",
+                  borderRadius: "12px",
+                  boxShadow: scanningChannel ? "0 0 15px rgba(255, 0, 127, 0.1)" : "none"
+                }}>
+                  <div>
+                    <h4 style={{ margin: 0, fontSize: "14px", fontWeight: 700, display: "flex", alignItems: "center", gap: "8px" }}>
+                      {scanningChannel ? `🔍 Auto-Tamizado Activo: Canal CH ${scanningChannel}` : "🔍 Auto-Tamizado (Escaneo DMX)"}
+                      {scanningChannel && <span style={{ width: "8px", height: "8px", borderRadius: "50%", display: "inline-block", backgroundColor: "var(--accent-red)", animation: "pulse 1.5s infinite" }}></span>}
+                    </h4>
+                    <p style={{ margin: "4px 0 0 0", fontSize: "11px", color: "var(--text-secondary)", lineHeight: "1.4" }}>
+                      {scanningChannel 
+                        ? `Probando canal DMX ${scanningChannel}... Observa tu lámpara PAR-040 física. ¿Se encendió de color Rojo?` 
+                        : "Envía una señal secuencial de prueba canal por canal para descubrir cuál controla el color Rojo de tu PAR-040."}
+                    </p>
+                  </div>
+                  <button 
+                    type="button"
+                    className={`btn ${scanningChannel ? 'btn-danger' : 'btn-primary'}`}
+                    onClick={runAutoScan}
+                    style={{ padding: "8px 16px", fontSize: "12px", borderRadius: "8px", display: "flex", alignItems: "center", gap: "6px" }}
+                  >
+                    {scanningChannel ? "Detener Escaneo" : "Iniciar Auto-Tamizado"}
+                  </button>
+                </div>
+
+                <div className="faders-container" style={{ flex: 1, overflowY: "auto" }}>
                 {Array.from({ length: 64 }).map((_, idx) => {
                   const channelNum = idx + 1;
                   const val = dmxBuffer[idx] || 0;
@@ -802,9 +1123,268 @@ export default function App() {
                   );
                 })}
               </div>
-            ) : (
+            </div>
+          ) : (
               // LIGHTING DOCTOR OBSERVED vs EXPECTED Gemelo Digital View
               <div style={{ display: "flex", flexDirection: "column", gap: "20px", overflowY: "auto", flex: 1 }}>
+                
+                {/* Selector de Origen de Diagnóstico */}
+                <div className="panel" style={{ background: "rgba(0,0,0,0.15)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <h4 style={{ margin: 0, fontSize: "14px", fontWeight: 700 }}>Origen de Sensor de Diagnóstico</h4>
+                    <p style={{ margin: "4px 0 0 0", fontSize: "11px", color: "var(--text-secondary)" }}>
+                      Elige entre el simulador lógico, la cámara web del dispositivo o capturar tu pantalla.
+                    </p>
+                  </div>
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <button 
+                      type="button"
+                      className={`btn ${sensorSource === 'simulated' ? 'btn-active' : ''}`}
+                      onClick={() => setSensorSource('simulated')}
+                      style={{ padding: "6px 12px", fontSize: "12px" }}
+                    >
+                      Simulador
+                    </button>
+                    <button 
+                      type="button"
+                      className={`btn ${sensorSource === 'webcam' ? 'btn-active' : ''}`}
+                      onClick={() => setSensorSource('webcam')}
+                      style={{ padding: "6px 12px", fontSize: "12px", borderColor: "var(--accent-cyan)", color: sensorSource === 'webcam' ? "var(--accent-cyan)" : undefined }}
+                    >
+                      Cámara Web 📷
+                    </button>
+                    <button 
+                      type="button"
+                      className={`btn ${sensorSource === 'screen' ? 'btn-active' : ''}`}
+                      onClick={() => setSensorSource('screen')}
+                      style={{ padding: "6px 12px", fontSize: "12px", borderColor: "var(--accent-magenta)", color: sensorSource === 'screen' ? "var(--accent-magenta)" : undefined }}
+                    >
+                      Compartir Pantalla 🖥️
+                    </button>
+                  </div>
+                </div>
+
+                {/* Cámara de Diagnóstico Visual */}
+                {(sensorSource === "webcam" || sensorSource === "screen") && (
+                  <div className="panel" style={{ background: "rgba(0,0,0,0.2)", display: "flex", flexDirection: "column", gap: "12px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <h4 style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "14px", fontWeight: 700 }}>
+                        <Camera size={16} style={{ color: sensorSource === 'screen' ? "var(--accent-magenta)" : "var(--accent-cyan)" }} />
+                        Diagnóstico por Video: {sensorSource === 'screen' ? "Captura de Pantalla" : "Cámara Web"}
+                      </h4>
+                      {cameraError ? (
+                        <span style={{ color: "var(--accent-red)", fontSize: "11px" }}>{cameraError}</span>
+                      ) : (
+                        <span style={{ color: "var(--accent-green)", fontSize: "11px", display: "flex", alignItems: "center", gap: "4px" }}>
+                          <span style={{ width: "6px", height: "6px", borderRadius: "50%", backgroundColor: "var(--accent-green)", display: "inline-block" }}></span>
+                          Transmisión Activa (640x480)
+                        </span>
+                      )}
+                    </div>
+                    
+                    <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr", gap: "15px" }}>
+                      {/* Video Feed container */}
+                      <div 
+                        style={{ 
+                          position: "relative", 
+                          width: "100%", 
+                          aspectRatio: "4/3", 
+                          background: "#000", 
+                          borderRadius: "12px", 
+                          overflow: "hidden",
+                          border: isCalibrating ? "2px solid var(--accent-magenta)" : "1px solid var(--border-color)",
+                          cursor: "crosshair",
+                          boxShadow: isCalibrating ? "0 0 20px rgba(255, 0, 127, 0.4)" : "none",
+                          transition: "border 0.3s, box-shadow 0.3s"
+                        }}
+                        onClick={(e) => {
+                          if (!selectedFixtureId || !videoRef.current || isCalibrating) return;
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          const x = ((e.clientX - rect.left) / rect.width) * 100;
+                          const y = ((e.clientY - rect.top) / rect.height) * 100;
+                          setFixtureCoords(prev => ({
+                            ...prev,
+                            [selectedFixtureId]: { x, y }
+                          }));
+                        }}
+                      >
+                        <video 
+                          ref={videoRef} 
+                          autoPlay 
+                          playsInline 
+                          muted 
+                          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                        />
+                        <canvas 
+                          ref={canvasRef} 
+                          width={320} 
+                          height={240} 
+                          style={{ display: "none" }}
+                        />
+
+                        {isCalibrating && (
+                          <div style={{
+                            position: "absolute",
+                            top: 0,
+                            left: 0,
+                            width: "100%",
+                            height: "100%",
+                            background: "rgba(0,0,0,0.85)",
+                            display: "flex",
+                            flexDirection: "column",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            color: "var(--accent-magenta)",
+                            zIndex: 20
+                          }}>
+                            <span style={{ fontSize: "24px", animation: "pulse 1.5s infinite" }}>🌑</span>
+                            <span style={{ fontSize: "12px", fontWeight: 700, marginTop: "8px" }}>CALIBRANDO NIVEL DE NEGRO...</span>
+                          </div>
+                        )}
+                        
+                        {/* Overlays for fixture coordinates */}
+                        {!isCalibrating && fixtures.map(f => {
+                          const coords = fixtureCoords[f.id] || { x: 50, y: 50 };
+                          const isSelected = selectedFixtureId === f.id;
+                          const color = cameraSensors[f.id] ? `rgb(${cameraSensors[f.id].r}, ${cameraSensors[f.id].g}, ${cameraSensors[f.id].b})` : "var(--accent-cyan)";
+                          
+                          return (
+                            <div
+                              key={f.id}
+                              style={{
+                                position: "absolute",
+                                left: `${coords.x}%`,
+                                top: `${coords.y}%`,
+                                transform: "translate(-50%, -50%)",
+                                width: isSelected ? "36px" : "28px",
+                                height: isSelected ? "36px" : "28px",
+                                borderRadius: "50%",
+                                border: `2px solid ${isSelected ? "var(--accent-magenta)" : "rgba(255,255,255,0.7)"}`,
+                                boxShadow: isSelected ? "0 0 12px var(--accent-magenta)" : "0 0 8px rgba(0,0,0,0.5)",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                cursor: "pointer",
+                                backgroundColor: "rgba(0,0,0,0.4)",
+                                transition: "width 0.2s, height 0.2s, border 0.2s",
+                                zIndex: isSelected ? 10 : 5
+                              }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedFixtureId(f.id);
+                              }}
+                              title={`${f.name} - Haz clic en el video para reposicionar`}
+                            >
+                              <div style={{
+                                width: "10px",
+                                height: "10px",
+                                borderRadius: "50%",
+                                backgroundColor: color,
+                                border: "1px solid rgba(255,255,255,0.8)",
+                                margin: "auto"
+                              }} />
+                              <span style={{
+                                position: "absolute",
+                                bottom: "-18px",
+                                background: "rgba(0,0,0,0.75)",
+                                color: isSelected ? "var(--accent-magenta)" : "#fff",
+                                fontSize: "9px",
+                                padding: "1px 4px",
+                                borderRadius: "4px",
+                                whiteSpace: "nowrap",
+                                fontWeight: isSelected ? 700 : 500,
+                                transform: "translateX(-50%)",
+                                left: "50%"
+                              }}>
+                                {f.name.split(" ").pop()}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      
+                      {/* Settings & Guide */}
+                      <div style={{ display: "flex", flexDirection: "column", justifyContent: "space-between", fontSize: "12px" }}>
+                        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                          <div>
+                            <h5 style={{ color: "var(--text-primary)", marginBottom: "4px", fontWeight: 700 }}>Alineación de Sensores</h5>
+                            <p style={{ color: "var(--text-secondary)", lineHeight: "1.3", margin: 0 }}>
+                              Coloca el marcador del fixture (<strong>{selectedFixture?.name || "Ninguno"}</strong>) sobre el foco correspondiente en el video.
+                            </p>
+                          </div>
+
+                          {/* Control de ganancia */}
+                          <div className="form-group" style={{ margin: 0, padding: "8px", background: "rgba(255,255,255,0.02)", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: "11px", marginBottom: "4px" }}>
+                              <span>Sensibilidad (Ganancia)</span>
+                              <span style={{ color: "var(--accent-cyan)", fontWeight: 700 }}>{cameraGain.toFixed(1)}x</span>
+                            </div>
+                            <input 
+                              type="range"
+                              min="1.0"
+                              max="3.0"
+                              step="0.1"
+                              value={cameraGain}
+                              onChange={(e) => setCameraGain(Number(e.target.value))}
+                              style={{ width: "100%", accentColor: "var(--accent-cyan)" }}
+                            />
+                          </div>
+
+                          {/* Botón calibrar ambiental */}
+                          <button
+                            type="button"
+                            className="btn btn-primary"
+                            onClick={calibrateAmbient}
+                            disabled={isCalibrating}
+                            style={{ 
+                              padding: "8px", 
+                              fontSize: "11px", 
+                              width: "100%", 
+                              background: "linear-gradient(135deg, #7928CA, #FF0080)",
+                              boxShadow: "0 4px 10px rgba(255, 0, 128, 0.2)"
+                            }}
+                          >
+                            {isCalibrating ? "Apagando luces y midiendo..." : "Calibrar Luz de Fondo 🌑"}
+                          </button>
+
+                          <div style={{ display: "flex", flexDirection: "column", gap: "5px", maxHeight: "110px", overflowY: "auto" }}>
+                            {fixtures.map(f => {
+                              const coords = fixtureCoords[f.id] || { x: 50, y: 50 };
+                              const col = cameraSensors[f.id] ? `rgb(${cameraSensors[f.id].r}, ${cameraSensors[f.id].g}, ${cameraSensors[f.id].b})` : "rgba(255,255,255,0.1)";
+                              return (
+                                <div 
+                                  key={f.id} 
+                                  style={{ 
+                                    display: "flex", 
+                                    justifyContent: "space-between", 
+                                    alignItems: "center", 
+                                    padding: "5px 8px", 
+                                    background: selectedFixtureId === f.id ? "rgba(255, 0, 127, 0.08)" : "rgba(255,255,255,0.02)", 
+                                    borderRadius: "6px",
+                                    border: selectedFixtureId === f.id ? "1px solid rgba(255, 0, 127, 0.3)" : "1px solid var(--border-color)",
+                                    cursor: "pointer"
+                                  }}
+                                  onClick={() => setSelectedFixtureId(f.id)}
+                                >
+                                  <span style={{ fontWeight: selectedFixtureId === f.id ? 700 : 500, fontSize: "11px" }}>{f.name}</span>
+                                  <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                    <span style={{ fontSize: "9px", color: "var(--text-muted)" }}>{coords.x.toFixed(0)}%, {coords.y.toFixed(0)}%</span>
+                                    <div style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: col, border: "1px solid rgba(255,255,255,0.2)" }} />
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                        
+                        <div style={{ background: "rgba(0, 240, 255, 0.05)", border: "1px solid rgba(0, 240, 255, 0.15)", padding: "8px", borderRadius: "8px", marginTop: "6px", fontSize: "10px" }}>
+                          <strong style={{ color: "var(--accent-cyan)", display: "block" }}>💡 Tips de Calibración:</strong>
+                          Presiona el botón de fondo negro para aislar reflejos fijos del entorno de tus focos.
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 
                 {selectedFixture ? (
                   <>
